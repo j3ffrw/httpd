@@ -1,0 +1,18 @@
+# custom build apache benchmark
+# https://chrismiles.livejournal.com/21720.html
+# https://rainbow.chard.org/2012/09/14/using-ab-to-benchmark-with-different-or-random-requests/
+# 
+# Allows ab to bypass or invalidate cdn/web cache by passing random parameters
+
+# Build image
+docker build -t custom-ab .
+
+# Create container
+docker run --entrypoint bash -it --rm custom-ab
+
+# Test ab
+apk upgrade --update-cache --available && \
+    apk add openssl && \
+    rm -rf /var/cache/apk/*
+for x in {1..1000}; do openssl rand -hex 10 >> request.txt; done
+ab -R request.txt -n 1 'https://www.google.com/?s='

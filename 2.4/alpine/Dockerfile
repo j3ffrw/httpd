@@ -21,6 +21,8 @@ ENV HTTPD_SHA256 a497652ab3fc81318cdc2a203090a999150d86461acff97c1065dc910fe10f4
 # https://httpd.apache.org/security/vulnerabilities_24.html
 ENV HTTPD_PATCHES=""
 
+COPY *patch Dockerfile /patch/
+
 # see https://httpd.apache.org/docs/2.4/install.html#requirements
 RUN set -eux; \
 	\
@@ -103,7 +105,6 @@ RUN set -eux; \
 	tar -xf httpd.tar.bz2 -C src --strip-components=1; \
 	rm httpd.tar.bz2; \
 	cd src; \
-	\
 	patches() { \
 		while [ "$#" -gt 0 ]; do \
 			local patchFile="$1"; shift; \
@@ -115,7 +116,14 @@ RUN set -eux; \
 		done; \
 	}; \
 	patches $HTTPD_PATCHES; \
-	\
+	local_patches () { \
+		find /patch/ -type f -name "*.patch" | while read patch; do \
+		  echo "Applying local patch: $patch"; \
+                  patch -p0 < "$patch"; \
+		done; \
+	}; \
+	local_patches; \
+        \
 	gnuArch="$(dpkg-architecture --query DEB_BUILD_GNU_TYPE)"; \
 	./configure \
 		--build="$gnuArch" \

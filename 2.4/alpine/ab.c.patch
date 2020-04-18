@@ -1,0 +1,189 @@
+--- support/ab.c
++++ support/ab.c
+@@ -288,6 +288,8 @@
+ enum {NO_METH = 0, GET, HEAD, PUT, POST, CUSTOM_METHOD} method = NO_METH;
+ const char *method_str[] = {"bug", "GET", "HEAD", "PUT", "POST", ""};
+ int send_body = 0;      /* non-zero if sending body with request */
++int posting = 0;        /* GET by default */
++int request_append = 0; /* Whether extra data needs to be appended to requests */
+ int requests = 1;       /* Number of requests to make */
+ int heartbeatres = 100; /* How often do we say we're alive */
+ int concurrency = 1;    /* Number of multiple requests to make */
+@@ -302,7 +304,10 @@
+ const char *host_field;       /* value of "Host:" header field */
+ const char *path;             /* path name */
+ char *postdata;         /* *buffer containing data from postfile */
++char *reqdata;          /* *buffer containing data from request file */
++char *req_p;            /* pointer to position in request data */
+ apr_size_t postlen = 0; /* length of data to be POSTed */
++apr_size_t append_req_len = 0; /* length of request data to be appended */
+ char *content_type = NULL;     /* content type to put in POST header */
+ const char *cookie,           /* optional cookie line */
+            *auth,             /* optional (basic/uuencoded) auhentication */
+@@ -808,6 +813,66 @@
+         return;
+     }
+ 
++    char *eol;
++    char path_append[1024];
++    int snprintf_res;
++
++    /* modify request each time to append data from request file */
++    if (request_append == 1) {
++        eol = strchr(req_p, '\n');      /* end of current line */
++        if (eol == NULL)
++            eol = reqdata + append_req_len;    /* end of reqdata */
++    
++        apr_snprintf(path_append, eol-req_p+1, "%s", req_p);
++    
++        req_p = eol + 1;    /* next line */
++        if (req_p >= (reqdata + append_req_len))
++            req_p = reqdata;    /* back to start of request data */
++    
++        if (posting <= 0) {
++            snprintf_res = apr_snprintf(request, sizeof(_request),
++                "%s %s%s HTTP/1.0\r\n"
++                "User-Agent: ApacheBench/%s\r\n"
++                "%s" "%s" "%s"
++                "Host: %s%s\r\n"
++                "Accept: */*\r\n"
++                "%s" "\r\n",
++                (posting == 0) ? "GET" : "HEAD",
++                (isproxy) ? fullurl : path,
++                path_append,
++                AP_AB_BASEREVISION,
++                keepalive ? "Connection: Keep-Alive\r\n" : "",
++                cookie, auth, host_field, colonhost, hdrs);
++        }
++        else {
++            snprintf_res = apr_snprintf(request,  sizeof(_request),
++                "POST %s%s HTTP/1.0\r\n"
++                "User-Agent: ApacheBench/%s\r\n"
++                "%s" "%s" "%s"
++                "Host: %s%s\r\n"
++                "Accept: */*\r\n"
++                "Content-length: %" APR_SIZE_T_FMT "\r\n"
++                "Content-type: %s\r\n"
++                "%s"
++                "\r\n",
++                (isproxy) ? fullurl : path,
++                path_append,
++                AP_AB_BASEREVISION,
++                keepalive ? "Connection: Keep-Alive\r\n" : "",
++                cookie, auth,
++                host_field, colonhost, postlen,
++                (content_type[0]) ? content_type : "text/plain", hdrs);
++        }
++        if (snprintf_res >= sizeof(_request)) {
++            err("Request too long\n");
++        }
++
++        if (verbosity >= 2 && !request_append)
++            printf("INFO: POST header == \n---\n%s\n---\n", request);
++
++        reqlen = strlen(request);
++    }
++    
+     do {
+         apr_time_t tnow;
+         apr_size_t l = c->rwrite;
+@@ -1962,6 +2027,9 @@
+     con[0].socknum = 0;
+     start_connect(&con[0]);
+ 
++    if (request_append == 1)
++        req_p = reqdata;
++
+     do {
+         apr_int32_t n;
+         const apr_pollfd_t *pollresults, *pollfd;
+@@ -2116,6 +2184,7 @@
+     fprintf(stderr, "    -b windowsize   Size of TCP send/receive buffer, in bytes\n");
+     fprintf(stderr, "    -B address      Address to bind to when making outgoing connections\n");
+     fprintf(stderr, "    -p postfile     File containing data to POST. Remember also to set -T\n");
++    fprintf(stderr, "    -R reqfile      File containing lines to append to each request URL\n");
+     fprintf(stderr, "    -u putfile      File containing data to PUT. Remember also to set -T\n");
+     fprintf(stderr, "    -T content-type Content-type header to use for POST/PUT data, eg.\n");
+     fprintf(stderr, "                    'application/x-www-form-urlencoded'\n");
+@@ -2282,12 +2351,51 @@
+     return APR_SUCCESS;
+ }
+ 
++/* Open a file containing lines to append to each request
++ * For -R option.
++ */
++static int open_request_file(const char *rfile)
++{
++    apr_file_t *reqfd;
++    apr_finfo_t finfo;
++    apr_status_t rv;
++    char errmsg[120];
++
++    rv = apr_file_open(&reqfd, rfile, APR_READ, APR_OS_DEFAULT, cntxt);
++    if (rv != APR_SUCCESS) {
++        fprintf(stderr, "ab: Could not open POST data file (%s): %s\n", rfile,
++                apr_strerror(rv, errmsg, sizeof errmsg));
++        return rv;
++    }
++
++    apr_file_info_get(&finfo, APR_FINFO_NORM, reqfd);
++    append_req_len = (apr_size_t)finfo.size;
++    reqdata = malloc(append_req_len+2);
++    if (!reqdata) {
++        fprintf(stderr, "ab: Could not allocate request data buffer\n");
++        return APR_ENOMEM;
++    }
++    rv = apr_file_read_full(reqfd, reqdata, append_req_len, NULL);
++    if (rv != APR_SUCCESS) {
++        fprintf(stderr, "ab: Could not read request data file: %s\n",
++                apr_strerror(rv, errmsg, sizeof errmsg));
++        return rv;
++    }
++    apr_file_close(reqfd);
++    if (*(reqdata + append_req_len-1) != '\n')
++        *(reqdata + (append_req_len++) - 1) = '\n';
++    *(reqdata + append_req_len) = '\0';
++    
++    return 0;
++}
++
++
+ /* ------------------------------------------------------- */
+ 
+ /* sort out command-line args and call test */
+ int main(int argc, const char * const argv[])
+ {
+-    int l;
++    int r, l;
+     char tmp[1024];
+     apr_status_t status;
+     apr_getopt_t *opt;
+@@ -2340,7 +2448,7 @@
+     myhost = NULL; /* 0.0.0.0 or :: */
+ 
+     apr_getopt_init(&opt, cntxt, argc, argv);
+-    while ((status = apr_getopt(opt, "n:c:t:s:b:T:p:u:v:lrkVhwiIx:y:z:C:H:P:A:g:X:de:SqB:m:"
++    while ((status = apr_getopt(opt, "n:c:t:s:b:T:p:u:v:lrkVhwiIx:y:z:C:H:P:A:g:X:de:SqB:m:R:"
+ #ifdef USE_SSL
+             "Z:f:E:"
+ #endif
+@@ -2507,7 +2615,17 @@
+                 break;
+             case 'z':
+                 use_html = 1;
+-                tdstring = opt_arg;
++                tdstring = optarg;
++                break;
++            case 'R':
++                // if (posting > 0)
++                //     err("-R only applicable for non-POST requests\n");
++                if (0 == (r = open_request_file(opt_arg))) {
++                    request_append = 1;
++                }
++                else {
++                    exit(r);
++                }
+                 break;
+             case 'h':
+                 usage(argv[0]);
+
